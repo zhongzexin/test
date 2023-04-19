@@ -1,0 +1,145 @@
+pipeline {
+  agent any
+  parameters {
+    choice(name: 'DEPLOY_ENV', choices: ['dev', 'stg'], description: '发布环境')
+    choice(name: 'ACTION', choices: ['发布', '回滚'], description: '执行动作')  //选择形式列表参数
+    string(name: 'ROLL_BACK_COMMIT', defaultValue:  '--', description: '回滚到指定的一次提交')   //执行构建时需要手动配置字符串类型参数，之后赋值给变量
+  }
+      environment{
+        sub_module = 'MY_diagnosis_guazhou'    //git仓库中的模块名称
+        registry_host='docker.quant-cloud.cn'
+        image_name = 'my_diagnosis'
+        git_code_url = 'https://git.quant-cloud.cn/changjie/MY_diagnosis_guazhou.git'
+        git_branch = 'test1'
+        credentialsId = 'gitlab'
+        k8s_namespace = "cc"   //部署到k8s的指定命名空间
+        k8s_replicas = 1   //pod的副本数量
+        k8s_app_name = 'my-diagnosis-guazhou'   //名称，不能大写，符合域名字符规范
+
+        k8s_yaml = 'k8s-deploy.yaml'
+        dev_k8s_replicas = 1  //开发环境副本数
+        stg_k8s_replicas = 1    //测试环境副本数
+        dev_k8s_credentialsId = 'k8s-dev'  //开发环境
+        stg_k8s_credentialsId = 'k8s-stg'  //测试环境
+
+        tmp_dir = "tmp"   //临时文件目录名称
+    }
+
+    stages {
+            stage('拉取代码(发布)') {
+                when {environment name: 'ACTION', value: '发布'}
+                steps {
+                    script{
+                        echo '从Git仓库中拉取代码'
+                        git  branch: "${git_branch}", credentialsId: "${credentialsId}", url: "${git_code_url}"
+                        git_commit = sh(script:'git log -1 --pretty=format:\"%h\"',returnStdout: true).trim()
+                        echo "最新的代码GIT_COMMIT:${git_commit}"
+
+                        echo "根据发布环境进行变量赋值"
+                         if  (params.DEPLOY_ENV ==  'dev' ) {
+                             echo  "当前环境为：dev"
+                             k8s_credentialsId = env.dev_k8s_credentialsId
+                             k8s_replicas = env.dev_k8s_replicas
+                         }else if(params.DEPLOY_ENV ==  'stg') {
+                             echo  "当前环境为：stg"
+                             k8s_credentialsId = env.stg_k8s_credentialsId
+                             k8s_replicas = env.stg_k8s_replicas
+                         }
+                    }
+                }
+            }
+
+            stage('读取回滚TAG(回滚)') {
+                when {environment name: 'ACTION', value: '回滚'}
+                steps {
+                    script{
+                        git_commit = "${ROLL_BACK_COMMIT}"
+                        echo "本次回滚，用户输入的TAG: ${git_commit} "
+                    }
+                }
+            }
+
+          stage('检查镜像是否存在于仓库(发布/回滚)') {
+            steps {
+                script{
+                    image_exist="true"
+                    try{
+                       sh "docker pull ${registry_host}/${k8s_namespace}/${image_name}:${git_commit}";
+                    }catch(exc) {
+                       image_exist="false"
+                    }
+                    echo "----------------镜像${k8s_namespace}/${image_name}:${git_commit}是否存在:${image_exist}----------------"
+                }
+            }
+          }
+
+
+          stage('异常处理(回滚)') {
+            when {
+                    allOf{
+                     environment name: 'ACTION', value: '回滚';
+                     expression { "${image_exist}"=="false"}
+                    }
+            }
+            steps {
+                script{
+                    echo "----------------${registry_host}/${k8s_namespace}/${image_name}:${git_commit} 不存在--------------------------- "
+                    throw new Exception("回滚操作镜像必须存在于仓库")
+                }
+            }
+          }
+
+
+
+          stage('DOCKER容器镜像构建(发布)') {
+                when {
+                    allOf{
+                     environment name: 'ACTION', value: '发布';
+                     expression { "${image_exist}"=="false"}
+                    }
+                }
+                steps {
+                    script{
+                        sh "pwd"
+                        sh "rm -rf ${tmp_dir}" // 防止中间执行报错，未删除临时文件
+                        sh "mkdir ${tmp_dir}"     // 建立临时文件目录
+                        sh "mv ./bin ./${tmp_dir}/"  //移动所需代码
+                        sh "mv ./config ./${tmp_dir}/"  //移动所需代码
+                        sh "mv ./data ./${tmp_dir}/" //移动所需代码
+                        sh "mv ./dependecy ./${tmp_dir}/"  //移动所需代码
+                        sh "mv ./deploy ./${tmp_dir}/"  //移动所需代码
+                        sh "mv ./script ./${tmp_dir}/"  //移动所需代码
+                        sh "docker build -t ${registry_host}/${k8s_namespace}/${image_name}:${git_commit} -f  ${tmp_dir}/deploy/Dockerfile ."
+                        echo "----------------DOCKER容器镜像构建成功----------------"
+                        sh "rm -rf ${tmp_dir}" //删除临时文件
+                    }
+                }
+            }
+
+           stage('上传容器镜像(发布)') {
+                when {
+                    allOf{
+                     environment name: 'ACTION', value: '发布';
+                     expression { "${image_exist}"=="false"}
+                    }
+                }
+                steps {
+                        sh "docker push ${registry_host}/${k8s_namespace}/${image_name}:${git_commit}"
+                        echo "----------------上传容器镜像成功----------------"
+                }
+            }
+            stage('DEV环境更新部署K8S(发布/回滚)') {
+                steps {
+                         sh "pwd"
+                         sh "sed -e 's#{image}#${registry_host}/${k8s_namespace}/${image_name}:${git_commit}#g;s#{ENV}#${DEPLOY_ENV}#g;s#{namespace}#${k8s_namespace}#g;s#{app_name}#${k8s_app_name}#g;s#{replicas}#${k8s_replicas}#g'  ../tmp/deploy/k8s-deploy.tpl > ${k8s_yaml}"
+                         echo "---------------生成K8S文件---------------"
+                         sh "cat ${k8s_yaml}"
+                         echo "---------------发布k8s---------------"
+                         withKubeConfig([credentialsId: "${k8s_credentialsId}"]) {
+                                sh "kubectl apply -f ${k8s_yaml}"
+                         }
+                         sh "rm -f ${k8s_yaml}"
+                }
+            }
+      }
+}

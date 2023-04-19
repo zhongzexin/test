@@ -1,0 +1,6 @@
+FROM python:3.7.16
+
+ARG install_dir=/tmp
+
+COPY ./requirements.txt ${install_dir}/requirements.txt
+RUN  pip3 install -r  ${install_dir}/requirements.txt  -i http://pypi.douban.com/simple/ --trusted-host pypi.douban.com
