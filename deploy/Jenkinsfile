@@ -10,7 +10,7 @@ pipeline {
         registry_host='docker.quant-cloud.cn'
         image_name = 'my_diagnosis'
         git_code_url = 'https://git.quant-cloud.cn/changjie/MY_diagnosis_guazhou.git'
-        git_branch = 'test1'
+        git_branch = 'tornado'
         credentialsId = 'gitlab'
         k8s_namespace = "cc"   //部署到k8s的指定命名空间
         k8s_replicas = 1   //pod的副本数量
